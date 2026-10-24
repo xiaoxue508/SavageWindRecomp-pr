@@ -75,6 +75,7 @@ jobs:
           install: >-
             make
             zip
+            unzip
             curl
             tar
             mingw-w64-ucrt-x86_64-clang
