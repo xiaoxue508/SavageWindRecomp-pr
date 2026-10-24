@@ -24,6 +24,10 @@
 //   frame still calls (the composites' material ID, and with it the lighting). Dead blocks are reused three frames later,
 //   not at once: the command buffer that recorded there may still chain on from them. Memory added without a guest
 //   chunk (a null pool) gets shadow storage of its own.
+// - Lists in a memory pool die with it (nvnMemoryPoolFinalize: cmdbuf_pool_gone): on hardware their commands were in
+//   that memory. Without this, every list of every model ever unloaded stayed (issue #74: +6-10k shadows a load).
+// - A shadow's storage starts small and grows a block at a time: the memory the game adds is often far more than it
+//   records there (BOTW adds hundreds of KB where it records a few hundred bytes).
 // A command handle is the host address of a list's first record.
 static uint32_t cmd_cost(uint32_t op, uint32_t extra) { (void)op; return 8 + ((extra + 3) & ~3u); }
 
