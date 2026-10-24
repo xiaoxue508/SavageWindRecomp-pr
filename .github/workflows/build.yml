@@ -105,7 +105,7 @@ jobs:
 
       - name: Freeze the game-code generator (make gen-helper)
         shell: msys2 {0}
-        run: make gen-helper GEN_PY="$(command -v python)"
+        run: make gen-helper GEN_PY="$(cygpath -u "$pythonLocation")/python.exe"
 
       - name: Fetch zig (tools/fetch_zig.sh)
         shell: msys2 {0}
