@@ -1,0 +1,128 @@
+name: Sync upstream and build Windows
+
+# Keeps this fork's `test` branch in sync with Revivedx/SavageWindRecomp:test and
+# builds the Windows release zip from it (app only: no game code, no ROMs).
+# The build is the same as `make deps-windows && make gen-helper &&
+# tools/fetch_zig.sh && make dist` from docs/BUILD-windows.md.
+
+on:
+  schedule:
+    - cron: "0 2,8,14,20 * * *" # every 6 hours (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Checkout test
+        uses: actions/checkout@v4
+        with:
+          ref: test
+          fetch-depth: 0
+
+      - name: Merge upstream test
+        id: merge
+        run: |
+          set -e
+          git config user.name "sw-sync"
+          git config user.email "sw-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/Revivedx/SavageWindRecomp.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/Revivedx/SavageWindRecomp.git
+          git fetch upstream test
+          before=$(git rev-parse HEAD)
+          # -X ours: keep this repo's .github/workflows if upstream ever adds one
+          git merge --no-edit -X ours -m "sync: upstream $(git rev-parse --short upstream/test)" upstream/test || true
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $after"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push origin test
+            echo "Merged upstream into $after"
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout test
+        uses: actions/checkout@v4
+        with:
+          ref: test
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            zip
+            curl
+            tar
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-nasm
+
+      - name: Cache LGPL FFmpeg and zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/deps-win
+            build/zig
+            build/zig-slim
+          key: sw-deps-${{ runner.os }}-${{ hashFiles('tools/build_deps_windows.sh','tools/fetch_zig.sh','tools/zig_slim.sh') }}
+
+      - name: Build LGPL FFmpeg (make deps-windows)
+        shell: msys2 {0}
+        run: make deps-windows
+
+      - name: Freeze the game-code generator (make gen-helper)
+        shell: msys2 {0}
+        run: make gen-helper GEN_PY="$(command -v python)"
+
+      - name: Fetch zig (tools/fetch_zig.sh)
+        shell: msys2 {0}
+        run: bash tools/fetch_zig.sh
+
+      - name: Build and package (make dist)
+        shell: msys2 {0}
+        run: make dist
+
+      - name: List the package
+        shell: msys2 {0}
+        run: ls -lh build/dist/
+
+      - name: Upload the Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SavageWind-windows-${{ github.run_number }}
+          path: build/dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
