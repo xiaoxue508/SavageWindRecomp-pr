@@ -353,7 +353,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
        (unsigned long long)vk_completed_seq(), (unsigned long long)c->x[30]);
     // the queue first: up to the fence that sets it (a fence inside a command list: everything submitted so far)
     if (frame_split() && s->ticket) g_fs_sync0 = plat_now_ns();
-    if (async_exec()) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    if (async_exec() && !s->signaled) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
     if (host_work()) kernel_host_work_begin();
     if (flush) renderer_flush();
     else if (whole) renderer_sync();

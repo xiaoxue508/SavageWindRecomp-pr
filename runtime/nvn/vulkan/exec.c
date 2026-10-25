@@ -79,9 +79,6 @@ void vk_dyn_forget(void) { dyn_epoch++; }
 // keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
 static uint64_t key_gen = 1;
 static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
-static uint64_t tex_stage_gen[2] = {1, 1};  // bumped when textures or samplers change for a stage
-static uint64_t ubuf_stage_gen[2] = {1, 1}; // bumped when dynamic uniform buffer bindings change per stage
-static uint64_t stat_set_memo_hit, stat_set_memo_miss;
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
     if (dc.epoch == dyn_epoch) return;
     memset(&dc, 0xFF, sizeof dc);  // matches no value (floats: NaN)
@@ -171,7 +168,6 @@ static Sub *sub(void) {
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
-        tex_stage_gen[0]++; tex_stage_gen[1]++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
         s->main_begun = s->upload_begun = false;
     }
     return s;
@@ -492,15 +488,11 @@ static uint64_t gcopy_gen = 1;
 static struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
 static int nuub;
 static uint64_t uub_serial;
-static void guest_copy_flush(void) {
-    __atomic_fetch_add(&gcopy_gen, 1, __ATOMIC_RELAXED);
-    ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
-}
+static void guest_copy_flush(void) { __atomic_fetch_add(&gcopy_gen, 1, __ATOMIC_RELAXED); }
 
 // UpdateUniformBuffer wrote [lo, hi)
 static void uub_note(uint64_t lo, uint64_t hi) {
     uub_serial++;
-    ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
     for (int i = 0; i < nuub; i++)
         if (lo < uubt[i].hi && uubt[i].lo < hi) {
             if (lo < uubt[i].lo || hi > uubt[i].hi) {  // (grown: copies made before don't know it covers them)
@@ -718,9 +710,8 @@ const char *renderer_stats(void) {
              (double)stat_upload_bytes / 1048576.0);
     {
         size_t n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared, %llu memo hit, %llu miss), fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
-                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_set_memo_hit, (unsigned long long)stat_set_memo_miss,
-                 (unsigned long long)stat_feedback_loops,
+        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared), fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
+                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_feedback_loops,
                  (unsigned long long)stat_feedback_barriers, (unsigned long long)stat_gw_waits, (unsigned long long)stat_gw_holds);
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
@@ -731,7 +722,7 @@ const char *renderer_stats(void) {
         stat_build_waits = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = 0;
         stat_gw_waits = stat_gw_holds = 0;
-        stat_sets = stat_sets_reused = stat_set_memo_hit = stat_set_memo_miss = 0;
+        stat_sets = stat_sets_reused = 0;
         stat_feedback_loops = stat_feedback_barriers = 0;
     }
     stat_feedback_copies = stat_feedback_live = stat_upload_bytes = 0;
@@ -782,7 +773,6 @@ static void st_defaults(void) {
     st.poly[1] = 1; st.poly[2] = 2;
     st.line_width = 1.0f;
     for (int i = 0; i < 8; i++) { st.blend[i][1] = 2; st.blend[i][2] = 1; st.blend[i][3] = 2; st.blend[i][4] = 1; st.blend[i][5] = 1; st.blend[i][6] = 1; }
-    tex_stage_gen[0]++; tex_stage_gen[1]++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
 }
 
 void vk_exec_init(void) {
@@ -3463,20 +3453,10 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
 // dyn / ndyn: the offsets of its dynamic uniform buffers, by binding (ubo_dynamic_mark), appended.
-typedef struct {
-    uint32_t binding;
-    VkBuffer buf;
-    uint32_t range;
-    uint32_t off;
-} DynUboInfo;
-
-static DynUboInfo stage_dyn_info[2][32];
-static int stage_ndyn_info[2];
-
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
                                  uint32_t *dyn, int *ndyn) {
-    DynUboInfo dv[32];
+    struct { uint32_t binding, off; } dv[32];
     int nd = 0;
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
@@ -3509,8 +3489,6 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             int k = nd++;  // (by binding: the order vkCmdBindDescriptorSets takes them in)
             while (k > 0 && dv[k - 1].binding > b->binding) { dv[k] = dv[k - 1]; k--; }
             dv[k].binding = b->binding;
-            dv[k].buf = bi[n].buffer;
-            dv[k].range = (uint32_t)bi[n].range;
             dv[k].off = (uint32_t)bi[n].offset;
             bi[n].offset = 0;
             w[n].pBufferInfo = &bi[n];
@@ -3538,10 +3516,6 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         n++;
     }
     for (int i = 0; i < nd && dyn; i++) dyn[(*ndyn)++] = dv[i].off;
-    if (stage == 0 || stage == 1) {
-        stage_ndyn_info[stage] = nd;
-        memcpy(stage_dyn_info[stage], dv, sizeof(DynUboInfo) * (size_t)nd);
-    }
     return set_finish(layout, w, n);
 }
 
@@ -4622,119 +4596,19 @@ have_pipe:
     uint32_t dyn[64];
     int ndyn = 0;
     hud_clip = false;  // (hud_patch, while the vertex stage's constant buffers are bound)
-    static int no_set_memo = -1;
-    if (no_set_memo < 0) no_set_memo = getenv("SAVAGEWIND_VK_NO_SET_MEMO") != NULL;
-#define SET_MEMO_TAB 256
-    typedef struct {
-        Prog *pr;
-        uint64_t tex_gen;
-        uint64_t ubuf_gen;
-        uint32_t view_gen;
-        int sub;
-        int chunk;
-        int ndyn;
-        uint8_t dyn_bindings[16];
-        VkBuffer dyn_bufs[16];
-        uint32_t dyn_ranges[16];
-        uint32_t dyn[16];
-        VkDescriptorSet set;
-        float rs0[4];
-    } SetMemo;
-    static SetMemo vmemo_tab[SET_MEMO_TAB];
-    static SetMemo fmemo_tab[SET_MEMO_TAB];
-
-    uint32_t vslot = ((uintptr_t)pr >> 4) & (SET_MEMO_TAB - 1);
-    SetMemo *vm = &vmemo_tab[vslot];
-    VkDescriptorSet vset;
-    bool vhit = false;
-    bool v_tex_ok = pr->vi->ntex == 0 || vm->tex_gen == tex_stage_gen[0];
-    if (!no_set_memo && vm->pr == pr && vm->sub == cur_sub && vm->chunk == active && v_tex_ok) {
-        if (vm->ubuf_gen == ubuf_stage_gen[0]) {
-            vset = vm->set;
-            for (int i = 0; i < vm->ndyn; i++) dyn[ndyn++] = vm->dyn[i];
-            stat_set_memo_hit++;
-            vhit = true;
-        } else {
-            bool match = true;
-            uint32_t new_dyn[16];
-            for (int i = 0; i < vm->ndyn; i++) {
-                VkDescriptorBufferInfo bi = cbuf_info(0, pr->vi, vm->dyn_bindings[i], 0, 0, 0);
-                if (bi.buffer != vm->dyn_bufs[i] || bi.range != vm->dyn_ranges[i]) {
-                    match = false;
-                    break;
-                }
-                new_dyn[i] = (uint32_t)bi.offset;
-            }
-            if (match) {
-                vset = vm->set;
-                for (int i = 0; i < vm->ndyn; i++) {
-                    vm->dyn[i] = new_dyn[i];
-                    dyn[ndyn++] = new_dyn[i];
-                }
-                vm->ubuf_gen = ubuf_stage_gen[0];
-                stat_set_memo_hit++;
-                vhit = true;
-            }
-        }
-    }
-    if (!vhit) {
-        stat_set_memo_miss++;
-        int d0 = ndyn;
-        vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
-        vm->pr = pr;
-        vm->tex_gen = tex_stage_gen[0];
-        vm->ubuf_gen = ubuf_stage_gen[0];
-        vm->sub = cur_sub;
-        vm->chunk = active;
-        vm->set = vset;
-        int nd = stage_ndyn_info[0] < 16 ? stage_ndyn_info[0] : 16;
-        vm->ndyn = nd;
-        for (int i = 0; i < nd; i++) {
-            vm->dyn_bindings[i] = (uint8_t)stage_dyn_info[0][i].binding;
-            vm->dyn_bufs[i] = stage_dyn_info[0][i].buf;
-            vm->dyn_ranges[i] = stage_dyn_info[0][i].range;
-            vm->dyn[i] = stage_dyn_info[0][i].off;
-        }
-    }
+    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     PROFD_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
     sdw_fix.s = 0;
-    extern uint32_t vk_view_gen;
-    static struct {
-        uint64_t gen;
-        uint32_t view_gen;
-        Prog *pr;
-        VkDescriptorImageInfo fii[64];
-        float tex_sc[64][2];
-        uint32_t tex_wh[64][2];
-        __typeof__(sdw_fix) sdw;
-    } tmemo;
-
-    if (!no_set_memo && tmemo.pr == pr && tmemo.gen == tex_stage_gen[1] && tmemo.view_gen == vk_view_gen) {
-        int ntex = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
-        memcpy(fii, tmemo.fii, sizeof(VkDescriptorImageInfo) * (size_t)ntex);
-        memcpy(tex_sc[1], tmemo.tex_sc, sizeof(float) * 2 * (size_t)ntex);
-        memcpy(tex_wh[1], tmemo.tex_wh, sizeof(uint32_t) * 2 * (size_t)ntex);
-        sdw_fix = tmemo.sdw;
-    } else {
-        for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
-            float sc[2]; uint32_t wh[2];
-            texture_info(1, pr->fi, i, &fii[i], sc, wh);
-            tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
-            if (sc[0] > 1 && wh[0] == wh[1] && !sdw_fix.s) {  // a shadow map made bigger (its texel size: cbuf_info)
-                NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
-                if (t && vk_texture_scale_group(t) == RS_SHADOW) { sdw_fix.gw = wh[0]; sdw_fix.gh = wh[1]; sdw_fix.s = sc[0]; }
-            }
+    for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+        float sc[2]; uint32_t wh[2];
+        texture_info(1, pr->fi, i, &fii[i], sc, wh);
+        tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
+        if (sc[0] > 1 && wh[0] == wh[1] && !sdw_fix.s) {  // a shadow map made bigger (its texel size: cbuf_info)
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (t && vk_texture_scale_group(t) == RS_SHADOW) { sdw_fix.gw = wh[0]; sdw_fix.gh = wh[1]; sdw_fix.s = sc[0]; }
         }
-        tmemo.pr = pr;
-        tmemo.gen = tex_stage_gen[1];
-        tmemo.view_gen = vk_view_gen;
-        int ntex = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
-        memcpy(tmemo.fii, fii, sizeof(VkDescriptorImageInfo) * (size_t)ntex);
-        memcpy(tmemo.tex_sc, tex_sc[1], sizeof(float) * 2 * (size_t)ntex);
-        memcpy(tmemo.tex_wh, tex_wh[1], sizeof(uint32_t) * 2 * (size_t)ntex);
-        tmemo.sdw = sdw_fix;
     }
     if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
@@ -4782,62 +4656,7 @@ have_pipe:
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = profd ? SDL_GetTicksNS() : 0;
-    uint32_t fslot = (((uintptr_t)pr >> 4) ^ 0x5a5a) & (SET_MEMO_TAB - 1);
-    SetMemo *fm = &fmemo_tab[fslot];
-    VkDescriptorSet fset;
-    bool fhit = false;
-    bool f_tex_ok = pr->fi->ntex == 0 || (fm->tex_gen == tex_stage_gen[1] && fm->view_gen == vk_view_gen);
-    if (!no_set_memo && fm->pr == pr && fm->sub == cur_sub && fm->chunk == active && f_tex_ok &&
-        !memcmp(fm->rs0, rs0, sizeof rs0)) {
-        if (fm->ubuf_gen == ubuf_stage_gen[1]) {
-            fset = fm->set;
-            for (int i = 0; i < fm->ndyn; i++) dyn[ndyn++] = fm->dyn[i];
-            stat_set_memo_hit++;
-            fhit = true;
-        } else {
-            bool match = true;
-            uint32_t new_dyn[16];
-            for (int i = 0; i < fm->ndyn; i++) {
-                VkDescriptorBufferInfo bi = cbuf_info(1, pr->fi, fm->dyn_bindings[i], 0, 0, 0);
-                if (bi.buffer != fm->dyn_bufs[i] || bi.range != fm->dyn_ranges[i]) {
-                    match = false;
-                    break;
-                }
-                new_dyn[i] = (uint32_t)bi.offset;
-            }
-            if (match) {
-                fset = fm->set;
-                for (int i = 0; i < fm->ndyn; i++) {
-                    fm->dyn[i] = new_dyn[i];
-                    dyn[ndyn++] = new_dyn[i];
-                }
-                fm->ubuf_gen = ubuf_stage_gen[1];
-                stat_set_memo_hit++;
-                fhit = true;
-            }
-        }
-    }
-    if (!fhit) {
-        stat_set_memo_miss++;
-        int d1 = ndyn;
-        fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
-        fm->pr = pr;
-        fm->tex_gen = tex_stage_gen[1];
-        fm->view_gen = vk_view_gen;
-        fm->ubuf_gen = ubuf_stage_gen[1];
-        fm->sub = cur_sub;
-        fm->chunk = active;
-        memcpy(fm->rs0, rs0, sizeof rs0);
-        fm->set = fset;
-        int nd = stage_ndyn_info[1] < 16 ? stage_ndyn_info[1] : 16;
-        fm->ndyn = nd;
-        for (int i = 0; i < nd; i++) {
-            fm->dyn_bindings[i] = (uint8_t)stage_dyn_info[1][i].binding;
-            fm->dyn_bufs[i] = stage_dyn_info[1][i].buf;
-            fm->dyn_ranges[i] = stage_dyn_info[1][i].range;
-            fm->dyn[i] = stage_dyn_info[1][i].off;
-        }
-    }
+    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     sdw_fix.s = 0;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
@@ -5994,25 +5813,6 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_POLYGON: case CMD_BIND_VERTEX_ATTRIB: case CMD_BIND_VERTEX_STREAM: case CMD_SET_RENDER_TARGETS:
         case CMD_SET_DEPTH_CLAMP:
             key_gen++;
-            break;
-        default: break;
-        }
-        switch (r->op) {
-        case CMD_SET_TEXTURE_POOL: case CMD_SET_SAMPLER_POOL:
-            tex_stage_gen[0]++; tex_stage_gen[1]++;
-            break;
-        case CMD_BIND_TEXTURES: case CMD_BIND_TEXTURES_DEFERRED:
-            if (r->x[0] == 0) tex_stage_gen[0]++;
-            else if (r->x[0] == 1) tex_stage_gen[1]++;
-            else { tex_stage_gen[0]++; tex_stage_gen[1]++; }
-            break;
-        case CMD_UPDATE_UNIFORM_BUFFER:
-            ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
-            break;
-        case CMD_BIND_UNIFORM_BUFFERS:
-            if (r->x[0] == 0) ubuf_stage_gen[0]++;
-            else if (r->x[0] == 1) ubuf_stage_gen[1]++;
-            else { ubuf_stage_gen[0]++; ubuf_stage_gen[1]++; }
             break;
         default: break;
         }
