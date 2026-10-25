@@ -6082,6 +6082,7 @@ void backend_execute(uint64_t handle) {
     if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
     PROF_T0();
     in_execute = true;
+    nuub = 0;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
     exec_list(handle, 0);
     in_execute = false;

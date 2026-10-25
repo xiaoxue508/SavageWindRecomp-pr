@@ -318,6 +318,7 @@ uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
 NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
+    s->in_list = 0;
     if (async_exec()) {
         s->ticket = queue_put(QOP_FENCE, 0, s);
         TL("fence %llx queued as %llu (lr %llx)", (unsigned long long)A(1), (unsigned long long)s->ticket, (unsigned long long)c->x[30]);
@@ -353,7 +354,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
        (unsigned long long)vk_completed_seq(), (unsigned long long)c->x[30]);
     // the queue first: up to the fence that sets it (a fence inside a command list: everything submitted so far)
     if (frame_split() && s->ticket) g_fs_sync0 = plat_now_ns();
-    if (async_exec() && !s->signaled) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    if (async_exec()) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
     if (host_work()) kernel_host_work_begin();
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
