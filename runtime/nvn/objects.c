@@ -319,6 +319,8 @@ void renderer_wait_seq(uint64_t seq);
 NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
     s->in_list = 0;
+    s->signaled = 0;
+    s->seq = 0;
     if (async_exec()) {
         s->ticket = queue_put(QOP_FENCE, 0, s);
         TL("fence %llx queued as %llu (lr %llx)", (unsigned long long)A(1), (unsigned long long)s->ticket, (unsigned long long)c->x[30]);
@@ -328,7 +330,15 @@ NVN(nvnQueueFenceSync) {
     TL("fence %llx = seq %llu (lr %llx)", (unsigned long long)A(1), (unsigned long long)s->seq, (unsigned long long)c->x[30]);
 }
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
-void nvn_sync_in_list(uint64_t guest) { if (guest) sync_of(guest)->in_list = 1; }  // (cmdbuf.c: recording a list fence)
+void nvn_sync_in_list(uint64_t guest) {
+    if (guest) {
+        NvnSync *s = sync_of(guest);
+        s->in_list = 1;
+        s->signaled = 0;
+        s->seq = 0;
+        s->ticket = 0;
+    }
+}
 NVN(nvnQueueWaitSync) { RET(1); }
 
 // ================================================================== sync / event
@@ -360,6 +370,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     else if (whole) renderer_sync();
     else renderer_wait_seq(s->seq);  // only the submission that holds this fence
     if (host_work()) kernel_host_work_end();
+    s->signaled = 1;
     if (frame_split() && s->ticket) g_fs_sync1 = plat_now_ns();
     TL("syncwait done");
     RET(0);
