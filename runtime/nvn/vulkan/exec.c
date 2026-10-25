@@ -79,7 +79,7 @@ void vk_dyn_forget(void) { dyn_epoch++; }
 // keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
 static uint64_t key_gen = 1;
 static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
-static uint64_t set_desc_gen = 1;      // bumped when program, textures, samplers, or pass formats change
+static uint64_t tex_stage_gen[2] = {1, 1};  // bumped when textures or samplers change for a stage
 static uint64_t ubuf_stage_gen[2] = {1, 1}; // bumped when dynamic uniform buffer bindings change per stage
 static uint64_t stat_set_memo_hit, stat_set_memo_miss;
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
@@ -171,7 +171,7 @@ static Sub *sub(void) {
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
-        set_desc_gen++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
+        tex_stage_gen[0]++; tex_stage_gen[1]++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
         s->main_begun = s->upload_begun = false;
     }
     return s;
@@ -494,7 +494,7 @@ static int nuub;
 static uint64_t uub_serial;
 static void guest_copy_flush(void) {
     __atomic_fetch_add(&gcopy_gen, 1, __ATOMIC_RELAXED);
-    set_desc_gen++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
+    ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
 }
 
 // UpdateUniformBuffer wrote [lo, hi)
@@ -782,7 +782,7 @@ static void st_defaults(void) {
     st.poly[1] = 1; st.poly[2] = 2;
     st.line_width = 1.0f;
     for (int i = 0; i < 8; i++) { st.blend[i][1] = 2; st.blend[i][2] = 1; st.blend[i][3] = 2; st.blend[i][4] = 1; st.blend[i][5] = 1; st.blend[i][6] = 1; }
-    set_desc_gen++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
+    tex_stage_gen[0]++; tex_stage_gen[1]++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
 }
 
 void vk_exec_init(void) {
@@ -1260,7 +1260,6 @@ static void begin_pass(void) {
     vkCmdBeginRendering(cb, &ri);
     in_pass = true;
     key_gen++;  // (the pass's formats are in the pipeline key)
-    set_desc_gen++; ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -4628,9 +4627,11 @@ have_pipe:
 #define SET_MEMO_TAB 256
     typedef struct {
         Prog *pr;
-        uint64_t set_desc_gen;
+        uint64_t tex_gen;
         uint64_t ubuf_gen;
+        uint32_t view_gen;
         int sub;
+        int chunk;
         int ndyn;
         uint8_t dyn_bindings[16];
         VkBuffer dyn_bufs[16];
@@ -4646,7 +4647,8 @@ have_pipe:
     SetMemo *vm = &vmemo_tab[vslot];
     VkDescriptorSet vset;
     bool vhit = false;
-    if (!no_set_memo && vm->pr == pr && vm->set_desc_gen == set_desc_gen && vm->sub == cur_sub) {
+    bool v_tex_ok = pr->vi->ntex == 0 || vm->tex_gen == tex_stage_gen[0];
+    if (!no_set_memo && vm->pr == pr && vm->sub == cur_sub && vm->chunk == active && v_tex_ok) {
         if (vm->ubuf_gen == ubuf_stage_gen[0]) {
             vset = vm->set;
             for (int i = 0; i < vm->ndyn; i++) dyn[ndyn++] = vm->dyn[i];
@@ -4680,9 +4682,10 @@ have_pipe:
         int d0 = ndyn;
         vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
         vm->pr = pr;
-        vm->set_desc_gen = set_desc_gen;
+        vm->tex_gen = tex_stage_gen[0];
         vm->ubuf_gen = ubuf_stage_gen[0];
         vm->sub = cur_sub;
+        vm->chunk = active;
         vm->set = vset;
         int nd = stage_ndyn_info[0] < 16 ? stage_ndyn_info[0] : 16;
         vm->ndyn = nd;
@@ -4708,7 +4711,7 @@ have_pipe:
         __typeof__(sdw_fix) sdw;
     } tmemo;
 
-    if (!no_set_memo && tmemo.pr == pr && tmemo.gen == set_desc_gen && tmemo.view_gen == vk_view_gen) {
+    if (!no_set_memo && tmemo.pr == pr && tmemo.gen == tex_stage_gen[1] && tmemo.view_gen == vk_view_gen) {
         int ntex = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
         memcpy(fii, tmemo.fii, sizeof(VkDescriptorImageInfo) * (size_t)ntex);
         memcpy(tex_sc[1], tmemo.tex_sc, sizeof(float) * 2 * (size_t)ntex);
@@ -4725,7 +4728,7 @@ have_pipe:
             }
         }
         tmemo.pr = pr;
-        tmemo.gen = set_desc_gen;
+        tmemo.gen = tex_stage_gen[1];
         tmemo.view_gen = vk_view_gen;
         int ntex = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
         memcpy(tmemo.fii, fii, sizeof(VkDescriptorImageInfo) * (size_t)ntex);
@@ -4783,7 +4786,8 @@ have_pipe:
     SetMemo *fm = &fmemo_tab[fslot];
     VkDescriptorSet fset;
     bool fhit = false;
-    if (!no_set_memo && fm->pr == pr && fm->set_desc_gen == set_desc_gen && fm->sub == cur_sub &&
+    bool f_tex_ok = pr->fi->ntex == 0 || (fm->tex_gen == tex_stage_gen[1] && fm->view_gen == vk_view_gen);
+    if (!no_set_memo && fm->pr == pr && fm->sub == cur_sub && fm->chunk == active && f_tex_ok &&
         !memcmp(fm->rs0, rs0, sizeof rs0)) {
         if (fm->ubuf_gen == ubuf_stage_gen[1]) {
             fset = fm->set;
@@ -4818,9 +4822,11 @@ have_pipe:
         int d1 = ndyn;
         fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
         fm->pr = pr;
-        fm->set_desc_gen = set_desc_gen;
+        fm->tex_gen = tex_stage_gen[1];
+        fm->view_gen = vk_view_gen;
         fm->ubuf_gen = ubuf_stage_gen[1];
         fm->sub = cur_sub;
+        fm->chunk = active;
         memcpy(fm->rs0, rs0, sizeof rs0);
         fm->set = fset;
         int nd = stage_ndyn_info[1] < 16 ? stage_ndyn_info[1] : 16;
@@ -5992,9 +5998,13 @@ static void exec_list(uint64_t handle, int depth) {
         default: break;
         }
         switch (r->op) {
-        case CMD_BIND_PROGRAM: case CMD_SET_TEXTURE_POOL: case CMD_SET_SAMPLER_POOL:
-        case CMD_SET_RENDER_TARGETS: case CMD_BIND_TEXTURES: case CMD_BIND_TEXTURES_DEFERRED:
-            set_desc_gen++;
+        case CMD_SET_TEXTURE_POOL: case CMD_SET_SAMPLER_POOL:
+            tex_stage_gen[0]++; tex_stage_gen[1]++;
+            break;
+        case CMD_BIND_TEXTURES: case CMD_BIND_TEXTURES_DEFERRED:
+            if (r->x[0] == 0) tex_stage_gen[0]++;
+            else if (r->x[0] == 1) tex_stage_gen[1]++;
+            else { tex_stage_gen[0]++; tex_stage_gen[1]++; }
             break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             ubuf_stage_gen[0]++; ubuf_stage_gen[1]++;
