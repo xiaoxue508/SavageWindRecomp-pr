@@ -1,59 +1,17 @@
-name: Sync upstream and build Windows
-
-# Keeps this fork's `test` branch in sync with Revivedx/SavageWindRecomp:test and
-# builds the Windows release zip from it (app only: no game code, no ROMs).
-# The build is the same as `make deps-windows && make gen-helper &&
-# tools/fetch_zig.sh && make dist` from docs/BUILD-windows.md.
+name: Build Windows Release
 
 on:
-  schedule:
-    - cron: "0 2,8,14,20 * * *" # every 6 hours (UTC)
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-build
-  cancel-in-progress: false
+  group: build
+  cancel-in-progress: true
 
 jobs:
-  sync:
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.merge.outputs.changed }}
-    steps:
-      - name: Checkout test
-        uses: actions/checkout@v4
-        with:
-          ref: test
-          fetch-depth: 0
-
-      - name: Merge upstream test
-        id: merge
-        run: |
-          set -e
-          git config user.name "sw-sync"
-          git config user.email "sw-sync@users.noreply.github.com"
-          git remote add upstream https://github.com/Revivedx/SavageWindRecomp.git 2>/dev/null \
-            || git remote set-url upstream https://github.com/Revivedx/SavageWindRecomp.git
-          git fetch upstream test
-          before=$(git rev-parse HEAD)
-          # -X ours: keep this repo's .github/workflows if upstream ever adds one
-          git merge --no-edit -X ours -m "sync: upstream $(git rev-parse --short upstream/test)" upstream/test || true
-          after=$(git rev-parse HEAD)
-          if [ "$before" = "$after" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already up to date: $after"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            git push origin test
-            echo "Merged upstream into $after"
-          fi
-
   build:
-    needs: sync
-    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 180
     steps:
