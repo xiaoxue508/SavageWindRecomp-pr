@@ -4646,7 +4646,7 @@ have_pipe:
         VkDescriptorImageInfo fii[64];
         float tex_sc[64][2];
         uint32_t tex_wh[64][2];
-        struct { uint32_t gw, gh; float s; } sdw;
+        __typeof__(sdw_fix) sdw;
     } tmemo;
 
     if (!no_set_memo && tmemo.pr == pr && tmemo.gen == set_stage_gen[1] && tmemo.view_gen == vk_view_gen) {
